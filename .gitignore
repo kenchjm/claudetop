@@ -5,6 +5,9 @@
 # Marketing drafts (local only)
 marketing/
 
+# Project instructions (local only)
+CLAUDE.md
+
 # macOS
 .DS_Store
 
