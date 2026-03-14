@@ -5,11 +5,19 @@
 # Real-time status line showing project context, token usage,
 # cost insights, cache efficiency, and smart alerts.
 #
+# Environment variables:
+#   CLAUDETOP_THEME          compact|minimal|full (default: full)
+#   CLAUDETOP_DAILY_BUDGET   daily budget in USD (e.g., 50)
+#   CLAUDETOP_TAG            tag for session tracking (e.g., "auth-refactor")
+#
 # Plugin system: drop executable scripts into ~/.claude/claudetop.d/
 # Each plugin receives the session JSON on stdin and outputs a single
 # formatted string (ANSI OK). Plugins run with a 1s timeout.
 
 set -euo pipefail
+
+THEME="${CLAUDETOP_THEME:-full}"
+HISTORY_FILE="${HOME}/.claude/claudetop-history.jsonl"
 
 # Read JSON from stdin
 JSON=$(cat)
@@ -64,14 +72,6 @@ fmt_duration() {
 }
 
 # Cache-aware cost estimate per model
-# current_usage gives the cache breakdown for THIS turn only.
-# We extrapolate that ratio across cumulative total_input_tokens.
-# Pricing per MTok: [input, cache_write, cache_read, output]
-#   Opus:   $15,   $18.75,  $1.50,  $75
-#   Sonnet: $3,    $3.75,   $0.30,  $15
-#   Haiku:  $0.80, $1.00,   $0.08,  $4
-
-# Estimate cumulative cache breakdown from current turn's ratio
 CURRENT_TOTAL_IN=$((CACHE_READ + CACHE_CREATE + REGULAR_INPUT))
 if [ "$CURRENT_TOTAL_IN" -gt 0 ]; then
   EST_CACHE_READ=$(echo "scale=0; $INPUT_TOKENS * $CACHE_READ / $CURRENT_TOTAL_IN" | bc)
@@ -122,7 +122,6 @@ GRAY="\033[90m"
 
 # --- Time of day ---
 TIME_NOW=$(date +"%H:%M")
-# Dim after 10pm or before 6am as a gentle "it's late" nudge
 HOUR=$(date +"%H")
 if [ "$HOUR" -ge 22 ] || [ "$HOUR" -lt 6 ]; then
   TIME_FMT="${MAGENTA}${TIME_NOW}${RESET}"
@@ -130,8 +129,13 @@ else
   TIME_FMT="${DIM}${TIME_NOW}${RESET}"
 fi
 
+# --- Session tag ---
+TAG_FMT=""
+if [ -n "${CLAUDETOP_TAG:-}" ]; then
+  TAG_FMT=" ${DIM}#${CLAUDETOP_TAG}${RESET}"
+fi
+
 # --- Cost estimates per model (cache-aware) ---
-#                     input  cache_write  cache_read  output
 OPUS_COST=$(calc_cost   15     18.75        1.50       75)
 SONNET_COST=$(calc_cost  3      3.75        0.30       15)
 HAIKU_COST=$(calc_cost   0.80   1.00        0.08        4)
@@ -141,18 +145,14 @@ OPUS_COST_FMT=$(fmt_cost "$OPUS_COST")
 SONNET_COST_FMT=$(fmt_cost "$SONNET_COST")
 HAIKU_COST_FMT=$(fmt_cost "$HAIKU_COST")
 
-# Highlight current model's cost
 case "$MODEL_ID" in
   *opus*) OPUS_COST_FMT="${BOLD}${OPUS_COST_FMT}${RESET}${DIM}" ;;
   *sonnet*) SONNET_COST_FMT="${BOLD}${SONNET_COST_FMT}${RESET}${DIM}" ;;
   *haiku*) HAIKU_COST_FMT="${BOLD}${HAIKU_COST_FMT}${RESET}${DIM}" ;;
 esac
 
-# Format tokens
 IN_FMT=$(fmt_tokens "$INPUT_TOKENS")
 OUT_FMT=$(fmt_tokens "$OUTPUT_TOKENS")
-
-# Duration
 DUR_FMT=$(fmt_duration "$DURATION_MS")
 
 # --- Cost velocity ($/hr) ---
@@ -182,6 +182,24 @@ if [ "$TOTAL_INPUT" -gt 0 ]; then
     CACHE_RATIO="${YELLOW}${CACHE_PCT}%${RESET}"
   else
     CACHE_RATIO="${RED}${CACHE_PCT}%${RESET}"
+  fi
+fi
+
+# --- Context composition ---
+# Show input token breakdown: fresh vs cached vs output ratio
+CTX_COMP=""
+if [ "$TOTAL_INPUT" -gt 0 ]; then
+  FRESH_PCT=$(echo "scale=0; $REGULAR_INPUT * 100 / $TOTAL_INPUT" | bc)
+  WRITE_PCT=$(echo "scale=0; $CACHE_CREATE * 100 / $TOTAL_INPUT" | bc)
+  READ_PCT=$CACHE_PCT
+  # Output as % of total tokens (input + output)
+  TOTAL_ALL=$((TOTAL_INPUT + OUTPUT_TOKENS))
+  if [ "$TOTAL_ALL" -gt 0 ]; then
+    OUT_PCT=$(echo "scale=0; $OUTPUT_TOKENS * 100 / $TOTAL_ALL" | bc)
+    IN_PCT=$((100 - OUT_PCT))
+    CTX_COMP="${DIM}in:${IN_PCT}%${RESET} ${DIM}out:${OUT_PCT}%${RESET}"
+    # Show cache breakdown: fresh|write|read
+    CTX_COMP="${CTX_COMP} ${DIM}(${RESET}${GRAY}fresh:${FRESH_PCT}%${RESET} ${GRAY}cwrite:${WRITE_PCT}%${RESET} ${GRAY}cread:${READ_PCT}%${RESET}${DIM})${RESET}"
   fi
 fi
 
@@ -237,16 +255,49 @@ if [ "$LINES_ADDED" -gt 0 ] || [ "$LINES_REMOVED" -gt 0 ]; then
   DELTA=" ${DIM}${GREEN}+${LINES_ADDED}${RESET}${DIM}/${YELLOW}-${LINES_REMOVED}${RESET}"
 fi
 
+# --- Daily budget + forecast (from history) ---
+BUDGET_FMT=""
+FORECAST_FMT=""
+if [ -f "$HISTORY_FILE" ]; then
+  TODAY=$(date +"%Y-%m-%d")
+  # Sum today's completed sessions + current session cost (fast: grep + jq)
+  TODAY_PAST=$(grep "\"$TODAY" "$HISTORY_FILE" 2>/dev/null | jq -s '[.[].cost_usd] | add // 0' 2>/dev/null) || TODAY_PAST=0
+  TODAY_TOTAL=$(echo "scale=2; $TODAY_PAST + $COST" | bc)
+
+  # Budget alert
+  if [ -n "${CLAUDETOP_DAILY_BUDGET:-}" ]; then
+    BUDGET_PCT=$(echo "scale=0; $TODAY_TOTAL * 100 / $CLAUDETOP_DAILY_BUDGET" | bc 2>/dev/null) || BUDGET_PCT=0
+    BUDGET_LEFT=$(echo "scale=2; $CLAUDETOP_DAILY_BUDGET - $TODAY_TOTAL" | bc)
+    if [ "$(echo "$BUDGET_PCT >= 100" | bc)" -eq 1 ]; then
+      BUDGET_FMT="${RED}${BOLD}OVER BUDGET${RESET} ${DIM}(\$${TODAY_TOTAL}/\$${CLAUDETOP_DAILY_BUDGET})${RESET}"
+    elif [ "$(echo "$BUDGET_PCT >= 80" | bc)" -eq 1 ]; then
+      BUDGET_FMT="${YELLOW}budget: \$${BUDGET_LEFT} left${RESET}"
+    fi
+  fi
+
+  # Monthly forecast — extrapolate from recent daily average
+  # Use last 7 days of history for more stable estimate
+  WEEK_AGO=$(date -v-7d +"%Y-%m-%d" 2>/dev/null || date -d "7 days ago" +"%Y-%m-%d" 2>/dev/null || echo "")
+  if [ -n "$WEEK_AGO" ]; then
+    WEEK_COST=$(grep -E "\"(${WEEK_AGO}|$(date -v-6d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-5d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-4d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-3d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-2d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-1d +"%Y-%m-%d" 2>/dev/null || true)|${TODAY})" "$HISTORY_FILE" 2>/dev/null | jq -s '[.[].cost_usd] | add // 0' 2>/dev/null) || WEEK_COST=0
+    # Count distinct days in the window
+    DAYS_WITH_DATA=$(grep -E "\"(${WEEK_AGO}|$(date -v-6d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-5d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-4d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-3d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-2d +"%Y-%m-%d" 2>/dev/null || true)|$(date -v-1d +"%Y-%m-%d" 2>/dev/null || true)|${TODAY})" "$HISTORY_FILE" 2>/dev/null | jq -r '.timestamp[:10]' 2>/dev/null | sort -u | wc -l | tr -d ' ') || DAYS_WITH_DATA=0
+    if [ "$DAYS_WITH_DATA" -gt 0 ]; then
+      DAILY_AVG=$(echo "scale=2; $WEEK_COST / $DAYS_WITH_DATA" | bc)
+      MONTHLY_EST=$(echo "scale=0; $DAILY_AVG * 30" | bc)
+      if [ "$(echo "$MONTHLY_EST > 0" | bc)" -eq 1 ]; then
+        FORECAST_FMT="${DIM}~\$${MONTHLY_EST}/mo${RESET}"
+      fi
+    fi
+  fi
+fi
+
 # --- Plugin system ---
-# Scripts in ~/.claude/claudetop.d/ receive JSON on stdin, output one string each
-# They run with a 1s timeout to avoid blocking the status line
 PLUGIN_DIR="${HOME}/.claude/claudetop.d"
 PLUGIN_OUTPUT=""
 if [ -d "$PLUGIN_DIR" ]; then
   for plugin in "$PLUGIN_DIR"/*; do
     [ -f "$plugin" ] && [ -x "$plugin" ] || continue
-    # Run plugin, capture output, ignore failures
-    # Use perl alarm for timeout (works on macOS without coreutils)
     result=$(echo "$JSON" | perl -e 'alarm 1; exec @ARGV' "$plugin" 2>/dev/null) || true
     if [ -n "$result" ]; then
       if [ -n "$PLUGIN_OUTPUT" ]; then
@@ -259,24 +310,28 @@ if [ -d "$PLUGIN_DIR" ]; then
 fi
 
 # --- Alerts ---
-# Stateless alerts derived from current JSON snapshot. Collected into an array.
 declare -a ALERTS
 
-# 1. Session cost milestones
+# Cost milestones
 for THRESHOLD in 25 10 5; do
   if [ "$(echo "$COST >= $THRESHOLD" | bc)" -eq 1 ]; then
     ALERTS+=("${RED}${BOLD}\$${THRESHOLD} MARK${RESET}")
-    break  # Only show highest crossed threshold
+    break
   fi
 done
 
-# 2. Stale session — long duration + high context = diminishing returns
+# Budget alert
+if [ -n "$BUDGET_FMT" ]; then
+  ALERTS+=("$BUDGET_FMT")
+fi
+
+# Stale session
 DURATION_HOURS=$(echo "scale=2; $DURATION_MS / 3600000" | bc)
 if [ "$(echo "$DURATION_HOURS >= 2" | bc)" -eq 1 ] && [ "$CTX_USED" -ge 60 ]; then
   ALERTS+=("${YELLOW}CONSIDER FRESH SESSION${RESET}")
 fi
 
-# 3. Cache collapse — low cache when it should be high (session > 5min, cache < 20%)
+# Cache collapse
 DURATION_MIN=$((DURATION_MS / 60000))
 if [ "$DURATION_MIN" -ge 5 ] && [ "$TOTAL_INPUT" -gt 0 ]; then
   if [ "$CACHE_PCT" -lt 20 ]; then
@@ -284,17 +339,17 @@ if [ "$DURATION_MIN" -ge 5 ] && [ "$TOTAL_INPUT" -gt 0 ]; then
   fi
 fi
 
-# 4. Velocity spike — burn rate > $15/hr is excessive
+# Velocity spike
 if [ -n "$VELOCITY" ] && [ "$(echo "$RATE >= 15" | bc)" -eq 1 ]; then
   ALERTS+=("${RED}BURN RATE${RESET}")
 fi
 
-# 5. Output stall — spending money but no code output (cost > $1, zero lines)
+# Output stall
 if [ "$(echo "$COST >= 1" | bc)" -eq 1 ] && [ "$TOTAL_LINES" -eq 0 ]; then
   ALERTS+=("${YELLOW}SPINNING?${RESET}")
 fi
 
-# 6. Model mismatch — expensive per line on Opus, suggest switching
+# Model mismatch
 if [ "$TOTAL_LINES" -gt 0 ] && [ "$(echo "$CPL >= 0.05" | bc)" -eq 1 ]; then
   case "$MODEL_ID" in
     *opus*) ALERTS+=("${CYAN}TRY /fast${RESET}") ;;
@@ -311,55 +366,120 @@ for alert in "${ALERTS[@]+"${ALERTS[@]}"}"; do
   fi
 done
 
-# --- Output ---
-# Line 1: Time + Project + folder + model + duration + line delta
-printf "%b  " "$TIME_FMT"
-printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
-if [ -n "$REL_PATH" ]; then
-  printf "${DIM}%s${RESET}" "$REL_PATH"
-else
-  printf " ${DIM}%s${RESET}" "$SHORT_PROJECT"
-fi
-printf "  ${CYAN}%s${RESET}" "$MODEL_NAME"
-printf "  ${DIM}%s${RESET}" "$DUR_FMT"
-printf "%b" "$DELTA"
-echo ""
+# =============================================
+# OUTPUT — Theme-aware rendering
+# =============================================
 
-# Line 2: Tokens + context bar + compact warning + cost + velocity
-printf "${DIM}%s in / %s out  ${RESET}" "$IN_FMT" "$OUT_FMT"
-printf "%b ${DIM}%s%%${RESET}" "$CTX_BAR" "$CTX_USED"
-printf "%b" "$COMPACT_WARN"
-printf "  ${GREEN}%s${RESET}" "$ACTUAL_COST_FMT"
-if [ -n "$VELOCITY" ]; then
-  printf "  %b" "$VELOCITY"
-fi
-echo ""
-
-# Line 3: Cache + efficiency + model costs
-printf "${DIM}cache:${RESET} "
-if [ -n "$CACHE_RATIO" ]; then
-  printf "%b" "$CACHE_RATIO"
-else
-  printf "${GRAY}--${RESET}"
-fi
-if [ -n "$EFFICIENCY" ]; then
-  printf "  ${DIM}efficiency:${RESET} %b" "$EFFICIENCY"
-fi
-printf "${DIM}  opus:%b  sonnet:%b  haiku:%b${RESET}" "$OPUS_COST_FMT" "$SONNET_COST_FMT" "$HAIKU_COST_FMT"
-echo ""
-
-# Line 4 (optional): Alerts + Plugin outputs
-LINE4=""
-if [ -n "$ALERT_STR" ]; then
-  LINE4="$ALERT_STR"
-fi
-if [ -n "$PLUGIN_OUTPUT" ]; then
-  if [ -n "$LINE4" ]; then
-    LINE4="${LINE4}  ${DIM}|${RESET}  ${PLUGIN_OUTPUT}"
-  else
-    LINE4="$PLUGIN_OUTPUT"
+if [ "$THEME" = "compact" ]; then
+  # --- COMPACT: 1 line ---
+  printf "%b " "$TIME_FMT"
+  printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
+  printf "  ${CYAN}%s${RESET}" "$MODEL_NAME"
+  printf "  ${GREEN}%s${RESET}" "$ACTUAL_COST_FMT"
+  if [ -n "$VELOCITY" ]; then
+    printf " %b" "$VELOCITY"
   fi
-fi
-if [ -n "$LINE4" ]; then
-  printf "%b\n" "$LINE4"
+  printf "  %b ${DIM}%s%%${RESET}" "$CTX_BAR" "$CTX_USED"
+  printf "%b" "$COMPACT_WARN"
+  printf "%b" "$TAG_FMT"
+  if [ -n "$ALERT_STR" ]; then
+    printf "  %b" "$ALERT_STR"
+  fi
+  echo ""
+
+elif [ "$THEME" = "minimal" ]; then
+  # --- MINIMAL: 2 lines ---
+  # Line 1: project + model + duration + lines
+  printf "%b  " "$TIME_FMT"
+  printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
+  if [ -n "$REL_PATH" ]; then
+    printf "${DIM}%s${RESET}" "$REL_PATH"
+  fi
+  printf "  ${CYAN}%s${RESET}" "$MODEL_NAME"
+  printf "  ${DIM}%s${RESET}" "$DUR_FMT"
+  printf "%b" "$DELTA"
+  printf "%b" "$TAG_FMT"
+  echo ""
+
+  # Line 2: cost + velocity + context + cache + alerts
+  printf "${GREEN}%s${RESET}" "$ACTUAL_COST_FMT"
+  if [ -n "$VELOCITY" ]; then
+    printf "  %b" "$VELOCITY"
+  fi
+  if [ -n "$FORECAST_FMT" ]; then
+    printf "  %b" "$FORECAST_FMT"
+  fi
+  printf "  %b ${DIM}%s%%${RESET}" "$CTX_BAR" "$CTX_USED"
+  printf "%b" "$COMPACT_WARN"
+  if [ -n "$CACHE_RATIO" ]; then
+    printf "  ${DIM}cache:${RESET} %b" "$CACHE_RATIO"
+  fi
+  if [ -n "$ALERT_STR" ]; then
+    printf "  %b" "$ALERT_STR"
+  fi
+  echo ""
+
+else
+  # --- FULL: 3-5 lines (default) ---
+
+  # Line 1: Time + Project + folder + model + duration + line delta + tag
+  printf "%b  " "$TIME_FMT"
+  printf "${BOLD}${BLUE}%s${RESET}" "$PROJECT_NAME"
+  if [ -n "$REL_PATH" ]; then
+    printf "${DIM}%s${RESET}" "$REL_PATH"
+  else
+    printf " ${DIM}%s${RESET}" "$SHORT_PROJECT"
+  fi
+  printf "  ${CYAN}%s${RESET}" "$MODEL_NAME"
+  printf "  ${DIM}%s${RESET}" "$DUR_FMT"
+  printf "%b" "$DELTA"
+  printf "%b" "$TAG_FMT"
+  echo ""
+
+  # Line 2: Tokens + context bar + compact warning + cost + velocity + forecast
+  printf "${DIM}%s in / %s out  ${RESET}" "$IN_FMT" "$OUT_FMT"
+  printf "%b ${DIM}%s%%${RESET}" "$CTX_BAR" "$CTX_USED"
+  printf "%b" "$COMPACT_WARN"
+  printf "  ${GREEN}%s${RESET}" "$ACTUAL_COST_FMT"
+  if [ -n "$VELOCITY" ]; then
+    printf "  %b" "$VELOCITY"
+  fi
+  if [ -n "$FORECAST_FMT" ]; then
+    printf "  %b" "$FORECAST_FMT"
+  fi
+  echo ""
+
+  # Line 3: Cache + efficiency + model costs + context composition
+  printf "${DIM}cache:${RESET} "
+  if [ -n "$CACHE_RATIO" ]; then
+    printf "%b" "$CACHE_RATIO"
+  else
+    printf "${GRAY}--${RESET}"
+  fi
+  if [ -n "$EFFICIENCY" ]; then
+    printf "  ${DIM}efficiency:${RESET} %b" "$EFFICIENCY"
+  fi
+  printf "${DIM}  opus:%b  sonnet:%b  haiku:%b${RESET}" "$OPUS_COST_FMT" "$SONNET_COST_FMT" "$HAIKU_COST_FMT"
+  echo ""
+
+  # Line 4 (optional): Context composition (when there's data)
+  if [ -n "$CTX_COMP" ]; then
+    printf "%b\n" "$CTX_COMP"
+  fi
+
+  # Line 5 (optional): Alerts + Plugin outputs
+  LINE5=""
+  if [ -n "$ALERT_STR" ]; then
+    LINE5="$ALERT_STR"
+  fi
+  if [ -n "$PLUGIN_OUTPUT" ]; then
+    if [ -n "$LINE5" ]; then
+      LINE5="${LINE5}  ${DIM}|${RESET}  ${PLUGIN_OUTPUT}"
+    else
+      LINE5="$PLUGIN_OUTPUT"
+    fi
+  fi
+  if [ -n "$LINE5" ]; then
+    printf "%b\n" "$LINE5"
+  fi
 fi

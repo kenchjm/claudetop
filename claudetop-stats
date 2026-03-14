@@ -1,0 +1,288 @@
+#!/bin/bash
+# claudetop-stats — analytics for Claude Code session history
+# Reads ~/.claude/claudetop-history.jsonl
+#
+# Usage:
+#   claudetop-stats              # Today's summary
+#   claudetop-stats today        # Today's summary
+#   claudetop-stats week         # This week
+#   claudetop-stats month        # This month
+#   claudetop-stats all          # All time
+#   claudetop-stats tag <name>   # Filter by tag
+
+set -euo pipefail
+
+HISTORY_FILE="$HOME/.claude/claudetop-history.jsonl"
+
+# ANSI colors
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+MAGENTA=$'\033[35m'
+RED=$'\033[31m'
+BLUE=$'\033[34m'
+WHITE=$'\033[37m'
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+fmt_cost() {
+  # $1 = float dollars
+  printf "\$%.2f" "$1"
+}
+
+fmt_tokens() {
+  # $1 = integer token count
+  local n=$1
+  if (( n >= 1000000 )); then
+    awk "BEGIN { printf \"%.1fM\", $n/1000000 }"
+  elif (( n >= 1000 )); then
+    awk "BEGIN { printf \"%.1fK\", $n/1000 }"
+  else
+    echo "$n"
+  fi
+}
+
+fmt_duration_ms() {
+  # $1 = milliseconds (integer)
+  local ms=$1
+  local secs=$(( ms / 1000 ))
+  local hrs=$(( secs / 3600 ))
+  local mins=$(( (secs % 3600) / 60 ))
+  local rem=$(( secs % 60 ))
+  if (( hrs > 0 )); then
+    printf "%dh %dm" "$hrs" "$mins"
+  elif (( mins > 0 )); then
+    printf "%dm %ds" "$mins" "$rem"
+  else
+    printf "%ds" "$rem"
+  fi
+}
+
+# ── argument parsing ───────────────────────────────────────────────────────────
+
+MODE="${1:-today}"
+TAG_FILTER=""
+
+case "$MODE" in
+  today|week|month|all) ;;
+  tag)
+    TAG_FILTER="${2:-}"
+    if [[ -z "$TAG_FILTER" ]]; then
+      echo "${RED}Error:${RESET} 'tag' mode requires a tag name (e.g. claudetop-stats tag rri)" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "Usage: claudetop-stats [today|week|month|all|tag <name>]" >&2
+    exit 1
+    ;;
+esac
+
+# ── guard: missing/empty file ──────────────────────────────────────────────────
+
+if [[ ! -f "$HISTORY_FILE" || ! -s "$HISTORY_FILE" ]]; then
+  echo ""
+  echo "  ${DIM}No session history yet.${RESET}"
+  echo "  ${DIM}Install the SessionEnd hook to start collecting data:${RESET}"
+  echo "  ${DIM}  hooks/session-end.sh${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── date filter expressions (jq) ──────────────────────────────────────────────
+
+NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# macOS date arithmetic
+case "$MODE" in
+  today)
+    LABEL="Today"
+    SINCE=$(date -u +%Y-%m-%dT00:00:00Z)
+    ;;
+  week)
+    LABEL="This Week"
+    SINCE=$(date -u -v-7d +%Y-%m-%dT00:00:00Z 2>/dev/null \
+      || date -u --date="7 days ago" +%Y-%m-%dT00:00:00Z)
+    ;;
+  month)
+    LABEL="This Month"
+    SINCE=$(date -u -v-30d +%Y-%m-%dT00:00:00Z 2>/dev/null \
+      || date -u --date="30 days ago" +%Y-%m-%dT00:00:00Z)
+    ;;
+  all|tag)
+    LABEL="All Time"
+    [[ "$MODE" == "tag" ]] && LABEL="Tag: $TAG_FILTER"
+    SINCE="1970-01-01T00:00:00Z"
+    ;;
+esac
+
+# ── jq filter ─────────────────────────────────────────────────────────────────
+
+JQ_FILTER='
+  select(.timestamp >= $since)
+  | select(if $tag != "" then .tag == $tag else true end)
+'
+
+FILTERED=$(jq -c \
+  --arg since "$SINCE" \
+  --arg tag "$TAG_FILTER" \
+  "$JQ_FILTER" \
+  "$HISTORY_FILE")
+
+# ── check empty result ────────────────────────────────────────────────────────
+
+SESSION_COUNT=$(echo "$FILTERED" | grep -c . 2>/dev/null || true)
+
+if [[ "$SESSION_COUNT" -eq 0 ]]; then
+  echo ""
+  echo "  ${DIM}No sessions found for: ${LABEL}${RESET}"
+  echo ""
+  exit 0
+fi
+
+# ── compute aggregates ────────────────────────────────────────────────────────
+
+STATS=$(echo "$FILTERED" | jq -s '
+{
+  sessions:        length,
+  total_cost:      ([.[].cost_usd] | add),
+  total_input:     ([.[].input_tokens] | add),
+  total_output:    ([.[].output_tokens] | add),
+  total_lines_add: ([.[].lines_added] | add),
+  total_lines_rm:  ([.[].lines_removed] | add),
+  total_dur_ms:    ([.[].duration_ms] | add),
+  avg_dur_ms:      ([.[].duration_ms] | add / length),
+  avg_cost:        ([.[].cost_usd] | add / length),
+
+  most_expensive: (max_by(.cost_usd) | {
+    session_id: .session_id,
+    project: .project,
+    cost: .cost_usd,
+    ts: .timestamp
+  }),
+
+  by_model: (
+    group_by(.model)
+    | map({ key: .[0].model, value: ([.[].cost_usd] | add) })
+    | from_entries
+  ),
+
+  by_project: (
+    group_by(.project)
+    | map({ project: .[0].project, cost: ([.[].cost_usd] | add), sessions: length })
+    | sort_by(-.cost)
+    | .[0:5]
+  ),
+
+  first_ts: (min_by(.timestamp).timestamp),
+  last_ts:  (max_by(.timestamp).timestamp)
+}
+')
+
+# pull scalars into bash
+SESSIONS=$(echo "$STATS"    | jq '.sessions')
+TOTAL_COST=$(echo "$STATS"  | jq '.total_cost')
+AVG_COST=$(echo "$STATS"    | jq '.avg_cost')
+TOTAL_IN=$(echo "$STATS"    | jq '.total_input')
+TOTAL_OUT=$(echo "$STATS"   | jq '.total_output')
+LINES_ADD=$(echo "$STATS"   | jq '.total_lines_add')
+LINES_RM=$(echo "$STATS"    | jq '.total_lines_rm')
+TOTAL_DUR=$(echo "$STATS"   | jq '.total_dur_ms | floor | tonumber')
+AVG_DUR=$(echo "$STATS"     | jq '.avg_dur_ms | floor | tonumber')
+FIRST_TS=$(echo "$STATS"    | jq -r '.first_ts')
+LAST_TS=$(echo "$STATS"     | jq -r '.last_ts')
+
+# daily average
+DAYS=$(python3 -c "
+from datetime import datetime, timezone
+a = datetime.fromisoformat('${FIRST_TS}'.replace('Z','+00:00'))
+b = datetime.fromisoformat('${LAST_TS}'.replace('Z','+00:00'))
+diff = max((b - a).days, 1)
+import sys
+print(diff)
+" 2>/dev/null || echo 1)
+
+DAILY_AVG=$(awk "BEGIN { printf \"%.4f\", $TOTAL_COST / $DAYS }")
+
+# most expensive session fields
+ME_PROJECT=$(echo "$STATS"  | jq -r '.most_expensive.project')
+ME_COST=$(echo "$STATS"     | jq '.most_expensive.cost')
+ME_TS=$(echo "$STATS"       | jq -r '.most_expensive.ts')
+
+# ── render ────────────────────────────────────────────────────────────────────
+
+HR="${DIM}──────────────────────────────────────────────────────${RESET}"
+
+echo ""
+echo "  ${BOLD}${CYAN}claudetop-stats${RESET}  ${BOLD}${WHITE}${LABEL}${RESET}"
+echo "  $HR"
+
+# Summary row
+echo ""
+echo "  ${BOLD}Summary${RESET}"
+printf "    Sessions:     ${GREEN}%s${RESET}\n" "$SESSIONS"
+printf "    Total cost:   ${YELLOW}%s${RESET}\n" "$(fmt_cost "$TOTAL_COST")"
+printf "    Avg / session:${YELLOW}%s${RESET}\n" "  $(fmt_cost "$AVG_COST")"
+printf "    Daily avg:    ${YELLOW}%s${RESET}\n" "  $(fmt_cost "$DAILY_AVG")"
+
+# Tokens
+echo ""
+echo "  ${BOLD}Tokens${RESET}"
+TOTAL_TOKENS=$(( TOTAL_IN + TOTAL_OUT ))
+printf "    Input:        ${BLUE}%s${RESET}\n" "$(fmt_tokens "$TOTAL_IN")"
+printf "    Output:       ${BLUE}%s${RESET}\n" "$(fmt_tokens "$TOTAL_OUT")"
+printf "    Total:        ${BLUE}%s${RESET}\n" "$(fmt_tokens "$TOTAL_TOKENS")"
+
+# Code
+echo ""
+echo "  ${BOLD}Code changes${RESET}"
+printf "    Lines added:  ${GREEN}+%s${RESET}\n" "$LINES_ADD"
+printf "    Lines removed:${RED}-%s${RESET}\n" "$LINES_RM"
+
+# Duration
+echo ""
+echo "  ${BOLD}Duration${RESET}"
+printf "    Total:        ${MAGENTA}%s${RESET}\n" "$(fmt_duration_ms "$TOTAL_DUR")"
+printf "    Avg / session:${MAGENTA}%s${RESET}\n" "  $(fmt_duration_ms "$AVG_DUR")"
+
+# Most expensive
+echo ""
+echo "  ${BOLD}Most expensive session${RESET}"
+printf "    Project:      %s\n" "$ME_PROJECT"
+printf "    Cost:         ${YELLOW}%s${RESET}\n" "$(fmt_cost "$ME_COST")"
+printf "    When:         ${DIM}%s${RESET}\n" "$ME_TS"
+
+# By model
+echo ""
+echo "  ${BOLD}Cost by model${RESET}"
+echo "$STATS" | jq -r '
+  .by_model
+  | to_entries
+  | sort_by(-.value)
+  | .[]
+  | "    \(.key): \(.value)"
+' | while IFS= read -r line; do
+  MODEL_NAME=$(echo "$line" | awk '{print $1}')
+  MODEL_VAL=$(echo "$line"  | awk '{print $2}')
+  printf "    %-40s ${YELLOW}%s${RESET}\n" \
+    "$MODEL_NAME" "$(fmt_cost "$MODEL_VAL")"
+done
+
+# By project (top 5)
+echo ""
+echo "  ${BOLD}Top projects by cost${RESET}"
+echo "$STATS" | jq -r '
+  .by_project[]
+  | "\(.project)|\(.cost)|\(.sessions)"
+' | while IFS='|' read -r proj cost sess; do
+  printf "    %-30s ${YELLOW}%s${RESET}  ${DIM}(%s sessions)${RESET}\n" \
+    "$proj" "$(fmt_cost "$cost")" "$sess"
+done
+
+echo ""
+echo "  $HR"
+echo "  ${DIM}History: $HISTORY_FILE${RESET}"
+echo ""

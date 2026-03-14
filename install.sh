@@ -1,6 +1,6 @@
 #!/bin/bash
 # claudetop installer
-# Copies claudetop.sh to ~/.claude/ and configures the status line
+# Copies claudetop.sh to ~/.claude/ and configures the status line + SessionEnd hook
 
 set -euo pipefail
 
@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/.claude/claudetop.sh"
 PLUGIN_DIR="$HOME/.claude/claudetop.d"
 SETTINGS="$HOME/.claude/settings.json"
+STATS_DEST="/usr/local/bin/claudetop-stats"
 
 echo "Installing claudetop..."
 
@@ -34,33 +35,79 @@ for f in "$SCRIPT_DIR/plugins/examples/"*.sh; do
 done
 echo "  Copied example plugins to $PLUGIN_DIR/_examples/"
 
-# 5. Configure settings.json
+# 5. Install claudetop-stats CLI
+if [ -w "$(dirname "$STATS_DEST")" ]; then
+  cp "$SCRIPT_DIR/claudetop-stats" "$STATS_DEST"
+  chmod +x "$STATS_DEST"
+  echo "  Installed claudetop-stats -> $STATS_DEST"
+else
+  echo "  Installing claudetop-stats (requires sudo)..."
+  sudo cp "$SCRIPT_DIR/claudetop-stats" "$STATS_DEST"
+  sudo chmod +x "$STATS_DEST"
+  echo "  Installed claudetop-stats -> $STATS_DEST"
+fi
+
+# 6. Copy SessionEnd hook
+HOOK_SRC="$SCRIPT_DIR/hooks/session-end.sh"
+HOOK_DEST="$HOME/.claude/hooks/claudetop-session-end.sh"
+mkdir -p "$HOME/.claude/hooks"
+cp "$HOOK_SRC" "$HOOK_DEST"
+chmod +x "$HOOK_DEST"
+echo "  Copied session-end hook -> $HOOK_DEST"
+
+# 7. Configure settings.json
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
 
-if grep -q '"statusLine"' "$SETTINGS" 2>/dev/null; then
-  echo ""
-  echo "  Warning: statusLine already configured in $SETTINGS"
-  echo "  To use claudetop, update it manually to:"
-  echo '    "statusLine": { "type": "command", "command": "~/.claude/claudetop.sh", "padding": 1 }'
-else
-  # Use jq to add statusLine config (or python as fallback)
-  if command -v jq &>/dev/null; then
-    TMP=$(mktemp)
+if command -v jq &>/dev/null; then
+  TMP=$(mktemp)
+
+  # Add statusLine if not present
+  if ! grep -q '"statusLine"' "$SETTINGS" 2>/dev/null; then
     jq '. + {"statusLine": {"type": "command", "command": "~/.claude/claudetop.sh", "padding": 1}}' "$SETTINGS" > "$TMP"
     mv "$TMP" "$SETTINGS"
-    echo "  Configured statusLine in $SETTINGS"
+    TMP=$(mktemp)
+    echo "  Configured statusLine in settings.json"
   else
-    echo ""
-    echo "  jq not found. Add this to your $SETTINGS manually:"
-    echo '    "statusLine": { "type": "command", "command": "~/.claude/claudetop.sh", "padding": 1 }'
+    echo "  statusLine already configured (skipped)"
   fi
+
+  # Add SessionEnd hook if not present
+  if ! grep -q 'claudetop-session-end' "$SETTINGS" 2>/dev/null; then
+    jq --arg hook "$HOOK_DEST" '
+      .hooks //= {} |
+      .hooks.SessionEnd //= [] |
+      .hooks.SessionEnd += [{"matcher": "", "hooks": [{"type": "command", "command": $hook}]}]
+    ' "$SETTINGS" > "$TMP"
+    mv "$TMP" "$SETTINGS"
+    echo "  Added SessionEnd hook to settings.json"
+  else
+    echo "  SessionEnd hook already configured (skipped)"
+  fi
+else
+  echo ""
+  echo "  jq not found. Add these to $SETTINGS manually:"
+  echo '    "statusLine": { "type": "command", "command": "~/.claude/claudetop.sh", "padding": 1 }'
+  echo '    "hooks": { "SessionEnd": [{"matcher":"","hooks":[{"type":"command","command":"~/.claude/hooks/claudetop-session-end.sh"}]}] }'
 fi
 
 echo ""
-echo "Done! Restart Claude Code to see claudetop in action."
+echo "Done! Restart Claude Code to activate claudetop."
 echo ""
-echo "To enable more plugins, copy from $PLUGIN_DIR/_examples/:"
+echo "Optional config (add to env or ~/.bashrc):"
+echo "  export CLAUDETOP_DAILY_BUDGET=50    # Daily budget alert"
+echo "  export CLAUDETOP_THEME=minimal      # compact|minimal|full"
+echo "  export CLAUDETOP_TAG=my-feature     # Tag sessions for tracking"
+echo ""
+echo "View analytics:"
+echo "  claudetop-stats          # Today"
+echo "  claudetop-stats week     # This week"
+echo "  claudetop-stats month    # This month"
+echo "  claudetop-stats all      # All time"
+echo "  claudetop-stats tag X    # Filter by tag"
+echo ""
+echo "Enable more plugins:"
 echo "  cp $PLUGIN_DIR/_examples/spotify.sh $PLUGIN_DIR/"
-echo "  cp $PLUGIN_DIR/_examples/weather.sh $PLUGIN_DIR/"
+echo "  cp $PLUGIN_DIR/_examples/gh-ci-status.sh $PLUGIN_DIR/"
+echo "  cp $PLUGIN_DIR/_examples/meeting-countdown.sh $PLUGIN_DIR/"
