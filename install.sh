@@ -92,6 +92,25 @@ else
   echo '    "hooks": { "SessionEnd": [{"matcher":"","hooks":[{"type":"command","command":"~/.claude/hooks/claudetop-session-end.sh"}]}] }'
 fi
 
+# 8. Copy pricing updater + fetch initial pricing
+UPDATER_DEST="$HOME/.claude/update-claudetop-pricing.sh"
+cp "$SCRIPT_DIR/update-pricing.sh" "$UPDATER_DEST"
+chmod +x "$UPDATER_DEST"
+cp "$SCRIPT_DIR/pricing.json" "$HOME/.claude/claudetop-pricing.json"
+echo "  Installed pricing updater + initial pricing"
+
+# Try to fetch latest pricing now
+"$UPDATER_DEST" 2>/dev/null || true
+
+# 9. Set up daily pricing update (cron job at 6am)
+CRON_CMD="0 6 * * * $UPDATER_DEST >/dev/null 2>&1"
+if ! crontab -l 2>/dev/null | grep -q "update-claudetop-pricing"; then
+  (crontab -l 2>/dev/null || true; echo "$CRON_CMD") | crontab -
+  echo "  Added daily pricing update cron (6am)"
+else
+  echo "  Daily pricing cron already configured (skipped)"
+fi
+
 echo ""
 echo "Done! Restart Claude Code to activate claudetop."
 echo ""

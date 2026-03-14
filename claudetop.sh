@@ -135,10 +135,30 @@ if [ -n "${CLAUDETOP_TAG:-}" ]; then
   TAG_FMT=" ${DIM}#${CLAUDETOP_TAG}${RESET}"
 fi
 
-# --- Cost estimates per model (cache-aware) ---
-OPUS_COST=$(calc_cost   15     18.75        1.50       75)
-SONNET_COST=$(calc_cost  3      3.75        0.30       15)
-HAIKU_COST=$(calc_cost   0.80   1.00        0.08        4)
+# --- Load pricing (from daily cache or hardcoded defaults) ---
+PRICING_FILE="${HOME}/.claude/claudetop-pricing.json"
+if [ -f "$PRICING_FILE" ]; then
+  # Read all prices in a single jq call for performance
+  PRICES=$(jq -r '[
+    .models.opus.input, .models.opus.cache_write, .models.opus.cache_read, .models.opus.output,
+    .models.sonnet.input, .models.sonnet.cache_write, .models.sonnet.cache_read, .models.sonnet.output,
+    .models.haiku.input, .models.haiku.cache_write, .models.haiku.cache_read, .models.haiku.output
+  ] | @tsv' "$PRICING_FILE" 2>/dev/null) || PRICES=""
+fi
+
+if [ -n "${PRICES:-}" ]; then
+  read -r O_IN O_CW O_CR O_OUT S_IN S_CW S_CR S_OUT H_IN H_CW H_CR H_OUT <<< "$PRICES"
+else
+  # Hardcoded fallback (last known pricing)
+  O_IN=15; O_CW=18.75; O_CR=1.50; O_OUT=75
+  S_IN=3; S_CW=3.75; S_CR=0.30; S_OUT=15
+  H_IN=0.80; H_CW=1.00; H_CR=0.08; H_OUT=4
+fi
+
+# --- Cost estimates per model (cache-aware, dynamic pricing) ---
+OPUS_COST=$(calc_cost   "$O_IN" "$O_CW" "$O_CR" "$O_OUT")
+SONNET_COST=$(calc_cost "$S_IN" "$S_CW" "$S_CR" "$S_OUT")
+HAIKU_COST=$(calc_cost  "$H_IN" "$H_CW" "$H_CR" "$H_OUT")
 
 ACTUAL_COST_FMT=$(fmt_cost "$COST")
 
