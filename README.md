@@ -11,6 +11,10 @@
 
 ---
 
+<p align="center">
+  <img src="demo.gif" alt="claudetop demo" width="800">
+</p>
+
 ```
 14:32  my-project/src/app  Opus  20m 0s  +256/-43  #auth-refactor
 152.3K in / 45.2K out  ████░░░░░░ 38%  $3.47  $5.10/hr  ~$174/mo
