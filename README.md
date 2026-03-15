@@ -31,34 +31,27 @@ I built claudetop after noticing my model estimate showed $10 but the actual bil
 
 ## Install
 
-### As a Claude Code plugin (recommended)
-
-```bash
-claude plugin marketplace add liorwn/claudetop
-claude plugin install claudetop@liorwn/claudetop
-```
-
-This gives you the SessionEnd hook + all slash commands (`/claudetop:stats`, `/claudetop:dashboard`, `/claudetop:branch`, `/claudetop:export`, `/claudetop:pricing`) automatically.
-
-Then run the setup script to configure the status line + daily pricing updates:
-
-```bash
-cd ~/.claude/plugins/cache/liorwn/claudetop/*/
-./install.sh
-```
-
-### One-liner (no plugin)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/liorwn/claudetop/main/install.sh | bash
-```
-
-### Clone and run
+### Clone and install (recommended)
 
 ```bash
 git clone https://github.com/liorwn/claudetop.git
 cd claudetop && ./install.sh
 ```
+
+### One-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liorwn/claudetop/main/install.sh | bash
+```
+
+### As a Claude Code plugin
+
+```bash
+claude plugin marketplace add liorwn/claudetop
+claude plugin install claudetop
+```
+
+This gives you the SessionEnd hook + all slash commands (`/claudetop:stats`, `/claudetop:dashboard`, `/claudetop:branch`, `/claudetop:export`, `/claudetop:pricing`) automatically.
 
 Then restart Claude Code.
 

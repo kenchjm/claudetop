@@ -7,7 +7,13 @@
   "hooks": {
     "SessionEnd": "hooks/session-end.sh"
   },
-  "commands": [],
+  "commands": [
+    "commands/stats.md",
+    "commands/dashboard.md",
+    "commands/branch.md",
+    "commands/export.md",
+    "commands/pricing.md"
+  ],
   "skills": [],
   "repository": {
     "type": "git",
