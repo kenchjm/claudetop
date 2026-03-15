@@ -176,31 +176,39 @@ HAIKU_COST=$(calc_cost  "$H_IN" "$H_CW" "$H_CR" "$H_OUT")
 
 ACTUAL_COST_FMT=$(fmt_cost "$COST")
 
+# When actual cost >> snapshot estimate (stale session / post-compaction),
+# scale all model estimates by the same ratio so comparisons remain meaningful.
+# E.g. if you spent $5.61 on Sonnet but snapshot says ~$0.60, scale factor=9.35x
+# and Opus estimate becomes ~$8.30 instead of a misleading ~$0.89.
+STALE_SCALE="1"
+case "$MODEL_ID" in
+  *opus*)   _BASE_COST="$OPUS_COST" ;;
+  *sonnet*) _BASE_COST="$SONNET_COST" ;;
+  *haiku*)  _BASE_COST="$HAIKU_COST" ;;
+  *)        _BASE_COST="0" ;;
+esac
+if [ "$(echo "$_BASE_COST > 0 && $COST / $_BASE_COST > 1.5" | bc 2>/dev/null)" = "1" ]; then
+  STALE_SCALE=$(echo "scale=4; $COST / $_BASE_COST" | bc)
+  OPUS_COST=$(echo "scale=4; $OPUS_COST * $STALE_SCALE" | bc)
+  SONNET_COST=$(echo "scale=4; $SONNET_COST * $STALE_SCALE" | bc)
+  HAIKU_COST=$(echo "scale=4; $HAIKU_COST * $STALE_SCALE" | bc)
+fi
+
 # Model estimates always prefixed with ~ (they're approximations)
 OPUS_COST_FMT="~$(fmt_cost "$OPUS_COST")"
 SONNET_COST_FMT="~$(fmt_cost "$SONNET_COST")"
 HAIKU_COST_FMT="~$(fmt_cost "$HAIKU_COST")"
 
-# Highlight current model + flag large divergence from actual
+# Highlight current model (scaled estimates are accurate, no * needed)
 case "$MODEL_ID" in
   *opus*)
     OPUS_COST_FMT="${BOLD}${OPUS_COST_FMT}${RESET}${DIM}"
-    # If actual > 3x estimate, snapshot is stale (compaction lost token history)
-    if [ "$(echo "$OPUS_COST > 0 && $COST / $OPUS_COST > 3" | bc 2>/dev/null)" = "1" ]; then
-      OPUS_COST_FMT="${BOLD}~$(fmt_cost "$OPUS_COST")${RESET}${DIM}${RED}*${RESET}${DIM}"
-    fi
     ;;
   *sonnet*)
     SONNET_COST_FMT="${BOLD}${SONNET_COST_FMT}${RESET}${DIM}"
-    if [ "$(echo "$SONNET_COST > 0 && $COST / $SONNET_COST > 3" | bc 2>/dev/null)" = "1" ]; then
-      SONNET_COST_FMT="${BOLD}~$(fmt_cost "$SONNET_COST")${RESET}${DIM}${RED}*${RESET}${DIM}"
-    fi
     ;;
   *haiku*)
     HAIKU_COST_FMT="${BOLD}${HAIKU_COST_FMT}${RESET}${DIM}"
-    if [ "$(echo "$HAIKU_COST > 0 && $COST / $HAIKU_COST > 3" | bc 2>/dev/null)" = "1" ]; then
-      HAIKU_COST_FMT="${BOLD}~$(fmt_cost "$HAIKU_COST")${RESET}${DIM}${RED}*${RESET}${DIM}"
-    fi
     ;;
 esac
 
