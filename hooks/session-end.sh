@@ -40,26 +40,38 @@ jq -c \
 
 # Reset iTerm2 terminal on session end — back to default colors, clear title/badge
 if [ -n "${CLAUDETOP_ITERM:-}" ]; then
-  # Write directly to TTY for instant reset
   TTY_MAP="$HOME/.claude/claudetop-iterm-ttys"
   SESSION_ID="${ITERM_SESSION_ID:-}"
+
+  # Try PPID fallback if no session ID in env
   if [ -z "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
     PARENT_TTY=$(ps -p $PPID -o tty= 2>/dev/null | tr -d ' ')
-    if [ -n "$PARENT_TTY" ]; then
+    if [ -n "$PARENT_TTY" ] && [ "$PARENT_TTY" != "??" ]; then
       PARENT_TTY="/dev/${PARENT_TTY}"
       SESSION_ID=$(grep "=${PARENT_TTY}$" "$TTY_MAP" 2>/dev/null | head -1 | cut -d= -f1)
     fi
   fi
+
+  # Reset the specific TTY if we found the session
+  _reset_tty() {
+    local tty="$1" sid="$2"
+    [ -n "$tty" ] && [ -w "$tty" ] || return
+    printf "\033]1337;SetColors=bg=default\007" > "$tty"
+    printf "\033]1;\007" > "$tty"
+    printf "\033]1337;SetBadgeFormat=\007" > "$tty"
+    # Mark state file as stale so watcher stops
+    [ -n "$sid" ] && echo "timestamp=0" > "$HOME/.claude/claudetop-iterm-state.${sid}"
+  }
+
   if [ -n "$SESSION_ID" ] && [ -f "$TTY_MAP" ]; then
     MY_TTY=$(grep "^${SESSION_ID}=" "$TTY_MAP" 2>/dev/null | tail -1 | cut -d= -f2-)
-    if [ -n "$MY_TTY" ] && [ -w "$MY_TTY" ]; then
-      printf "\033]1337;SetColors=bg=default\007" > "$MY_TTY"
-      printf "\033]1;\007" > "$MY_TTY"
-      printf "\033]1337;SetBadgeFormat=\007" > "$MY_TTY"
+    _reset_tty "$MY_TTY" "$SESSION_ID"
+  else
+    # Fallback: reset ALL mapped TTYs (session is ending, be thorough)
+    if [ -f "$TTY_MAP" ]; then
+      while IFS='=' read -r sid tty; do
+        _reset_tty "$tty" "$sid"
+      done < "$TTY_MAP"
     fi
   fi
-
-  # Mark state file as stale so watcher stops
-  ITERM_STATE_FILE="$HOME/.claude/claudetop-iterm-state.${SESSION_ID:-default}"
-  echo "timestamp=0" > "$ITERM_STATE_FILE"
 fi
